@@ -1,0 +1,8 @@
+#!/bin/ash
+set -eu
+set -- rest-server \
+    --path /srv/restic-sftp/data \
+    --htpasswd-file /srv/restic-sftp/data/.restic-manager/secrets/rest-htpasswd \
+    --private-repos
+[ "${APPEND_ONLY:-0}" = 1 ] && set -- "$@" --append-only
+exec s6-setuidgid restic "$@"

@@ -1,0 +1,579 @@
+#!/bin/bash
+set -Eeuo pipefail
+umask 077
+
+readonly DATA_ROOT="${RESTIC_DATA_ROOT:-/srv/restic-sftp/data}"
+readonly CONFIG_ROOT="${RESTIC_CONFIG_ROOT:-${DATA_ROOT}/.restic-manager}"
+readonly REPO_CONFIG="${CONFIG_ROOT}/repositories"
+readonly SECRETS="${CONFIG_ROOT}/secrets"
+readonly CRON_FILE="${RESTIC_CRON_FILE:-/etc/crontabs/root}"
+readonly LOCK_ROOT="${RESTIC_LOCK_ROOT:-/run/lock/restic-manager}"
+readonly AUTHORIZED_KEYS="${RESTIC_AUTHORIZED_KEYS_FILE:-/home/restic/.ssh/authorized_keys}"
+readonly REST_USERNAME_FILE="${RESTIC_USERNAME_FILE:-${CONFIG_ROOT}/rest-username}"
+readonly READINESS_TIMEOUT="${RESTIC_READINESS_TIMEOUT:-120}"
+
+die() { echo "restic-manager: $*" >&2; exit 64; }
+need_root() {
+    [[ "${RESTIC_ALLOW_NON_ROOT_TESTS:-0}" == 1 ]] ||
+        [[ "$(id -u)" == 0 ]] ||
+        die "must run as root"
+}
+need_arg() { [[ $# -gt 1 && -n "$2" ]] || die "$1 requires a value"; }
+
+valid_slug() {
+    [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]
+}
+
+valid_username() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$ ]]
+}
+
+rest_username() {
+    local username
+    if [[ "${RESTIC_ALLOW_NON_ROOT_TESTS:-0}" == 1 && -n "${RESTIC_TEST_USERNAME:-}" ]]; then
+        username=${RESTIC_TEST_USERNAME}
+    else
+        [[ -f "${REST_USERNAME_FILE}" && ! -L "${REST_USERNAME_FILE}" ]] ||
+            die "REST username state is not ready"
+        IFS= read -r username <"${REST_USERNAME_FILE}"
+    fi
+    valid_username "${username}" || die "invalid stored REST username"
+    printf '%s\n' "${username}"
+}
+
+safe_directory() {
+    [[ -d "$1" && ! -L "$1" ]] || die "unsafe directory: $1"
+}
+
+acquire_repo_lock() {
+    valid_slug "$1" || die "invalid repository slug"
+    mkdir -p "${LOCK_ROOT}"
+    exec 9>"${LOCK_ROOT}/repo-$1.lock"
+    flock -n 9 || die "repository operation is already running for $1"
+}
+
+acquire_cron_lock() {
+    mkdir -p "${LOCK_ROOT}"
+    exec 8>"${LOCK_ROOT}/cron.lock"
+    flock 8
+}
+
+repo_path() {
+    valid_slug "$1" || die "invalid repository slug: $1"
+    [[ "${DATA_ROOT}" == /* && "${DATA_ROOT}" != / ]] || die "data root must be an absolute non-root path"
+    local root username namespace
+    mkdir -p "${DATA_ROOT}"
+    safe_directory "${DATA_ROOT}"
+    root=$(cd "${DATA_ROOT}" && pwd -P)
+    username=$(rest_username)
+    namespace="${root}/${username}"
+    mkdir -p "${namespace}"
+    safe_directory "${namespace}"
+    if [[ "${RESTIC_ALLOW_NON_ROOT_TESTS:-0}" != 1 ]]; then
+        chown 1000:1000 "${namespace}"
+        chmod 0750 "${namespace}"
+    fi
+    printf '%s/%s\n' "${namespace}" "$1"
+}
+
+legacy_repo_path() {
+    valid_slug "$1" || die "invalid repository slug: $1"
+    local root
+    safe_directory "${DATA_ROOT}"
+    root=$(cd "${DATA_ROOT}" && pwd -P)
+    printf '%s/%s\n' "${root}" "$1"
+}
+
+secret_path() {
+    valid_slug "$1" || die "invalid repository slug"
+    printf '%s/%s.password\n' "${SECRETS}" "$1"
+}
+
+read_password_stdin() {
+    [[ ! -t 0 ]] || die "--password-stdin requires piped input"
+    IFS= read -r PASSWORD || true
+    [[ -n "${PASSWORD:-}" ]] || die "empty repository password"
+}
+
+atomic_write() {
+    local target=$1 mode=$2 tmp
+    tmp=$(mktemp "${target}.XXXXXX")
+    cat >"${tmp}"
+    chmod "${mode}" "${tmp}"
+    mv -f "${tmp}" "${target}"
+}
+
+repository_opens_with() {
+    local repo=$1 password_file=$2
+    run_restic "${repo}" "${password_file}" cat config >/dev/null
+}
+
+run_restic() {
+    local repo=$1 password_file=$2 runtime_secret status=0
+    shift 2
+    if [[ "${RESTIC_ALLOW_NON_ROOT_TESTS:-0}" == 1 ]]; then
+        RESTIC_REPOSITORY="${repo}" RESTIC_PASSWORD_FILE="${password_file}" \
+            restic "$@"
+        return
+    fi
+    [[ -f "${password_file}" && ! -L "${password_file}" ]] ||
+        die "repository password file is unsafe"
+    install -d -o root -g restic -m 0710 /run/restic-manager
+    runtime_secret=$(mktemp /run/restic-manager/password.XXXXXX)
+    install -o root -g restic -m 0640 "${password_file}" "${runtime_secret}"
+    su-exec restic:restic env \
+        RESTIC_REPOSITORY="${repo}" \
+        RESTIC_PASSWORD_FILE="${runtime_secret}" \
+        restic --no-cache "$@" ||
+        status=$?
+    rm -f "${runtime_secret}"
+    return "${status}"
+}
+
+rest_http_status() {
+    local username=$1 repo=$2 config
+    config=$(mktemp)
+    chmod 0600 "${config}"
+    {
+        printf 'silent\nshow-error\noutput = "/dev/null"\nwrite-out = "%%{http_code}"\n'
+        printf 'user = "%s:%s"\n' "${username}" "$(cat "${SECRETS}/rest-password")"
+        printf 'url = "http://127.0.0.1:8000/%s/%s/config"\n' "${username}" "${repo}"
+    } >"${config}"
+    curl --config "${config}" 2>/dev/null || true
+    rm -f "${config}"
+}
+
+wait_for_runtime() {
+    [[ "${RESTIC_ALLOW_NON_ROOT_TESTS:-0}" == 1 ]] && return 0
+    [[ "${READINESS_TIMEOUT}" =~ ^[0-9]+$ ]] || die "invalid readiness timeout"
+    local deadline=$((SECONDS + READINESS_TIMEOUT))
+    while ((SECONDS < deadline)); do
+        if
+            [[ -d /run/service/rest-server && -d /run/service/crond ]] &&
+            [[ "$(s6-svstat -o up /run/service/rest-server 2>/dev/null)" == true ]] &&
+            [[ "$(s6-svstat -o up /run/service/crond 2>/dev/null)" == true ]]
+        then
+            return 0
+        fi
+        sleep 1
+    done
+    die "required Restic services did not become ready"
+}
+
+validate_retention_values() {
+    local enabled=$1 schedule=$2 timezone=$3 keep_daily=$4 keep_weekly=$5 keep_monthly=$6
+    [[ "${enabled}" =~ ^[01]$ ]] || die "enabled must be 0 or 1"
+    [[ "${schedule}" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "schedule must be HH:MM"
+    [[ "${timezone}" != /* && "${timezone}" != *..* && -f "/usr/share/zoneinfo/${timezone}" ]] ||
+        die "invalid IANA timezone"
+    [[ "${keep_daily}" =~ ^[0-9]+$ && "${keep_weekly}" =~ ^[0-9]+$ && "${keep_monthly}" =~ ^[0-9]+$ ]] ||
+        die "keep values must be non-negative integers"
+    ((keep_daily <= 100000 && keep_weekly <= 100000 && keep_monthly <= 100000)) ||
+        die "keep values are too large"
+    ((keep_daily + keep_weekly + keep_monthly > 0)) || die "at least one keep value is required"
+}
+
+parse_common() {
+    REPO=''
+    PASSWORD_STDIN=0
+    while (($#)); do
+        case "$1" in
+            --repo) need_arg "$@"; REPO=$2; shift 2 ;;
+            --password-stdin) PASSWORD_STDIN=1; shift ;;
+            *) die "unknown argument: $1" ;;
+        esac
+    done
+    [[ -n "${REPO}" ]] || die "--repo is required"
+    valid_slug "${REPO}" || die "invalid repository slug"
+}
+
+op_init() {
+    parse_common "$@"
+    [[ "${PASSWORD_STDIN}" == 1 ]] || die "init requires --password-stdin"
+    read_password_stdin
+    local repo secret temporary legacy
+    wait_for_runtime
+    repo=$(repo_path "${REPO}")
+    secret=$(secret_path "${REPO}")
+    legacy=$(legacy_repo_path "${REPO}")
+    mkdir -p "${REPO_CONFIG}" "${SECRETS}"
+    safe_directory "${REPO_CONFIG}"
+    safe_directory "${SECRETS}"
+    temporary=$(mktemp "${SECRETS}/${REPO}.candidate.XXXXXX")
+    trap 'rm -f "${temporary:-}"' RETURN
+    printf '%s\n' "${PASSWORD}" >"${temporary}"
+    chmod 0600 "${temporary}"
+
+    if [[ -e "${legacy}/config" && "${legacy}" != "${repo}" ]]; then
+        [[ ! -e "${repo}" ]] || die "both legacy and private repository paths exist"
+        safe_directory "${legacy}"
+        [[ -f "${legacy}/config" && ! -L "${legacy}/config" ]] ||
+            die "legacy repository config is unsafe"
+        repository_opens_with "${legacy}" "${temporary}" ||
+            die "legacy repository does not accept supplied password"
+        mkdir -p "$(dirname "${repo}")"
+        mv "${legacy}" "${repo}"
+        if ! repository_opens_with "${repo}" "${temporary}"; then
+            mv "${repo}" "${legacy}"
+            die "legacy repository migration verification failed"
+        fi
+    fi
+    if [[ -e "${repo}" ]]; then
+        safe_directory "${repo}"
+    else
+        mkdir -p "${repo}"
+    fi
+    if [[ "${RESTIC_ALLOW_NON_ROOT_TESTS:-0}" != 1 ]]; then
+        chown -R restic:restic "${repo}"
+    fi
+    if [[ -e "${repo}/config" ]]; then
+        [[ -f "${repo}/config" && ! -L "${repo}/config" ]] ||
+            die "repository config is unsafe"
+        repository_opens_with "${repo}" "${temporary}" ||
+            die "repository does not accept supplied password"
+    else
+        [[ -z "$(find "${repo}" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+            die "repository directory is not empty"
+        run_restic "${repo}" "${temporary}" init
+        repository_opens_with "${repo}" "${temporary}" ||
+            die "initialized repository verification failed"
+    fi
+    atomic_write "${secret}" 0600 <"${temporary}"
+    if [[ "${RESTIC_ALLOW_NON_ROOT_TESTS:-0}" != 1 ]]; then
+        chown root:root "${secret}"
+        chmod 0600 "${secret}"
+    fi
+    repository_opens_with "${repo}" "${secret}" ||
+        die "persisted repository password verification failed"
+    rm -f "${temporary}"
+    trap - RETURN
+}
+
+write_repo_config() {
+    local slug=$1 enabled=$2 schedule=$3 timezone=$4 keep_daily=$5 keep_weekly=$6 keep_monthly=$7
+    valid_slug "${slug}" || die "invalid repository slug"
+    validate_retention_values "${enabled}" "${schedule}" "${timezone}" \
+        "${keep_daily}" "${keep_weekly}" "${keep_monthly}"
+    {
+        printf 'SLUG=%q\nENABLED=%q\nSCHEDULE=%q\nTIMEZONE=%q\n' "${slug}" "${enabled}" "${schedule}" "${timezone}"
+        printf 'KEEP_DAILY=%q\nKEEP_WEEKLY=%q\nKEEP_MONTHLY=%q\n' "${keep_daily}" "${keep_weekly}" "${keep_monthly}"
+    } | atomic_write "${REPO_CONFIG}/${slug}.conf" 0600
+}
+
+op_reconcile() {
+    [[ "${1:-}" == --all && $# == 1 ]] || die "reconcile requires --all"
+    mkdir -p "${REPO_CONFIG}" "${SECRETS}" "${LOCK_ROOT}" "$(dirname "${CRON_FILE}")"
+    acquire_cron_lock
+    publish_cron
+}
+
+# Caller holds the cron lock through configuration publication or rollback.
+publish_cron() {
+    local tmp config
+    tmp=$(mktemp "${CRON_FILE}.XXXXXX")
+    printf '# Generated by restic-manager; do not edit.\n' >"${tmp}"
+    shopt -s nullglob
+    for config in "${REPO_CONFIG}"/*.conf; do
+        [[ -f "${config}" && ! -L "${config}" ]] ||
+            die "unsafe repository config: ${config}"
+        # Files are root-only and generated by write_repo_config.
+        unset SLUG ENABLED SCHEDULE TIMEZONE KEEP_DAILY KEEP_WEEKLY KEEP_MONTHLY
+        # shellcheck disable=SC1090
+        source "${config}"
+        valid_slug "${SLUG:-}" || die "invalid slug in ${config}"
+        validate_retention_values "${ENABLED:-}" "${SCHEDULE:-}" \
+            "${TIMEZONE:-}" "${KEEP_DAILY:-}" "${KEEP_WEEKLY:-}" \
+            "${KEEP_MONTHLY:-}"
+        [[ "${ENABLED:-0}" == 1 ]] || continue
+        printf '* * * * * /usr/local/sbin/restic-manager retention --repo %s --scheduled\n' \
+            "${SLUG}" >>"${tmp}"
+    done
+    chmod 0600 "${tmp}"
+    mv -f "${tmp}" "${CRON_FILE}"
+}
+
+# Run with errexit in a subshell so every failed publication step restores the
+# prior settings before releasing the inherited repository lock and cron lock.
+configure_retention() (
+    local repo=$1 enabled=$2 schedule=$3 timezone=$4 keep_daily=$5 keep_weekly=$6 keep_monthly=$7
+    local verify=${8:-0} saved_config_path backup cron_backup had_config=0 had_cron=0 cron_published=0
+    saved_config_path="${REPO_CONFIG}/${repo}.conf"
+    mkdir -p "${REPO_CONFIG}" "$(dirname "${CRON_FILE}")"
+    acquire_cron_lock
+    backup=$(mktemp "${REPO_CONFIG}/.retention-backup.XXXXXX")
+    cron_backup=$(mktemp "${REPO_CONFIG}/.cron-backup.XXXXXX")
+    if [[ -e "${saved_config_path}" ]]; then
+        [[ -f "${saved_config_path}" && ! -L "${saved_config_path}" ]] || die "unsafe repository config"
+        cp -p "${saved_config_path}" "${backup}"
+        had_config=1
+    fi
+    if [[ -e "${CRON_FILE}" ]]; then
+        [[ -f "${CRON_FILE}" && ! -L "${CRON_FILE}" ]] || die "unsafe cron file"
+        cp -p "${CRON_FILE}" "${cron_backup}"
+        had_cron=1
+    fi
+    restore_retention_on_failure() {
+        local status=$?
+        trap - EXIT
+        if ((status != 0)); then
+            if ((had_config)); then
+                mv -f "${backup}" "${saved_config_path}" || die "could not restore retention config"
+            else
+                rm -f "${saved_config_path}"
+            fi
+            if ((cron_published)); then
+                if ((had_cron)); then
+                    mv -f "${cron_backup}" "${CRON_FILE}" || die "could not restore cron file"
+                else
+                    rm -f "${CRON_FILE}"
+                fi
+            fi
+        fi
+        rm -f "${backup}" "${cron_backup}"
+        exit "${status}"
+    }
+    trap restore_retention_on_failure EXIT
+    write_repo_config "${repo}" "${enabled}" "${schedule}" "${timezone}" \
+        "${keep_daily}" "${keep_weekly}" "${keep_monthly}"
+    publish_cron
+    cron_published=1
+    if [[ "${verify}" == 1 ]]; then
+        verify_bootstrap "${repo}" "${enabled}" "${schedule}" "${timezone}" \
+            "${keep_daily}" "${keep_weekly}" "${keep_monthly}"
+    fi
+)
+
+op_retention() {
+    local scheduled=0 filtered=()
+    while (($#)); do
+        case "$1" in
+            --scheduled) scheduled=1; shift ;;
+            *) filtered+=("$1"); shift ;;
+        esac
+    done
+    parse_common "${filtered[@]}"
+    [[ "${PASSWORD_STDIN}" == 0 ]] || die "retention does not accept passwords on stdin"
+    acquire_repo_lock "${REPO}"
+    local repo secret config
+    repo=$(repo_path "${REPO}")
+    secret=$(secret_path "${REPO}")
+    config="${REPO_CONFIG}/${REPO}.conf"
+    [[ -f "${repo}/config" && -f "${secret}" && -f "${config}" ]] || die "repository is not configured"
+    unset SLUG ENABLED SCHEDULE TIMEZONE KEEP_DAILY KEEP_WEEKLY KEEP_MONTHLY
+    # shellcheck disable=SC1090
+    source "${config}"
+    local args=(forget --prune)
+    if ((KEEP_DAILY > 0)); then args+=(--keep-daily "${KEEP_DAILY}"); fi
+    if ((KEEP_WEEKLY > 0)); then args+=(--keep-weekly "${KEEP_WEEKLY}"); fi
+    if ((KEEP_MONTHLY > 0)); then args+=(--keep-monthly "${KEEP_MONTHLY}"); fi
+    local stamp=''
+    if [[ "${scheduled}" == 1 ]]; then
+        [[ "${ENABLED}" == 1 ]] || return 0
+        local current run_id
+        current=$(TZ="${TIMEZONE}" date '+%H:%M')
+        [[ "${current}" == "${SCHEDULE}" ]] || return 0
+        run_id=$(TZ="${TIMEZONE}" date '+%Y%m%d-%H%M')
+        stamp="${CONFIG_ROOT}/last-${REPO}"
+        [[ ! -f "${stamp}" ]] || [[ "$(cat "${stamp}")" != "${run_id}" ]] ||
+            return 0
+    fi
+    run_restic "${repo}" "${secret}" "${args[@]}"
+    [[ -z "${stamp}" ]] || printf '%s\n' "${run_id}" | atomic_write "${stamp}" 0600
+}
+
+op_detach() {
+    parse_common "$@"
+    [[ "${PASSWORD_STDIN}" == 0 ]] || die "detach does not accept a password"
+    acquire_repo_lock "${REPO}"
+    rm -f "${REPO_CONFIG}/${REPO}.conf" "$(secret_path "${REPO}")"
+    op_reconcile --all
+}
+
+op_delete_data() {
+    parse_common "$@"
+    [[ "${PASSWORD_STDIN}" == 0 ]] || die "delete-data does not accept a password"
+    local repo
+    repo=$(repo_path "${REPO}")
+    acquire_repo_lock "${REPO}"
+    [[ -d "${repo}" ]] || die "repository does not exist"
+    [[ ! -L "${repo}" ]] || die "repository path must not be a symlink"
+    rm -rf -- "${repo}"
+    rm -f "${REPO_CONFIG}/${REPO}.conf" "$(secret_path "${REPO}")"
+    op_reconcile --all
+}
+
+op_configure() {
+    local repo='' enabled=0 schedule='' timezone='' keep_daily=0 keep_weekly=0 keep_monthly=0
+    while (($#)); do
+        case "$1" in
+            --repo) need_arg "$@"; repo=$2; shift 2 ;;
+            --enabled) need_arg "$@"; enabled=$2; shift 2 ;;
+            --schedule) need_arg "$@"; schedule=$2; shift 2 ;;
+            --timezone) need_arg "$@"; timezone=$2; shift 2 ;;
+            --keep-daily) need_arg "$@"; keep_daily=$2; shift 2 ;;
+            --keep-weekly) need_arg "$@"; keep_weekly=$2; shift 2 ;;
+            --keep-monthly) need_arg "$@"; keep_monthly=$2; shift 2 ;;
+            *) die "unknown argument: $1" ;;
+        esac
+    done
+    [[ -n "${repo}" && -n "${schedule}" && -n "${timezone}" ]] || die "configure requires repo, schedule, and timezone"
+    acquire_repo_lock "${repo}"
+    configure_retention "${repo}" "${enabled}" "${schedule}" "${timezone}" \
+        "${keep_daily}" "${keep_weekly}" "${keep_monthly}"
+}
+
+verify_bootstrap() {
+    local repo=$1 enabled=$2 schedule=$3 timezone=$4 keep_daily=$5 keep_weekly=$6 keep_monthly=$7
+    local path secret config expected matches
+    path=$(repo_path "${repo}")
+    secret=$(secret_path "${repo}")
+    config="${REPO_CONFIG}/${repo}.conf"
+    [[ -f "${path}/config" && ! -L "${path}/config" ]] || die "repository config postcondition failed"
+    [[ -f "${secret}" && ! -L "${secret}" ]] || die "repository password postcondition failed"
+    [[ -f "${config}" && ! -L "${config}" ]] || die "retention config postcondition failed"
+    repository_opens_with "${path}" "${secret}" || die "repository unlock postcondition failed"
+    if [[ "${RESTIC_ALLOW_NON_ROOT_TESTS:-0}" != 1 ]]; then
+        local username http_code deadline
+        username=$(rest_username)
+        deadline=$((SECONDS + READINESS_TIMEOUT))
+        http_code=''
+        while ((SECONDS < deadline)); do
+            http_code=$(rest_http_status "${username}" "${repo}")
+            [[ "${http_code}" == 200 ]] && break
+            sleep 1
+        done
+        [[ "${http_code}" == 200 ]] ||
+            die "authenticated REST repository postcondition failed"
+    fi
+    unset SLUG ENABLED SCHEDULE TIMEZONE KEEP_DAILY KEEP_WEEKLY KEEP_MONTHLY
+    # shellcheck disable=SC1090
+    source "${config}"
+    [[ "${SLUG}" == "${repo}" && "${ENABLED}" == "${enabled}" &&
+        "${SCHEDULE}" == "${schedule}" && "${TIMEZONE}" == "${timezone}" &&
+        "${KEEP_DAILY}" == "${keep_daily}" && "${KEEP_WEEKLY}" == "${keep_weekly}" &&
+        "${KEEP_MONTHLY}" == "${keep_monthly}" ]] ||
+        die "retention config values do not match requested state"
+    expected="* * * * * /usr/local/sbin/restic-manager retention --repo ${repo} --scheduled"
+    matches=$(grep -Fxc "${expected}" "${CRON_FILE}" || true)
+    if [[ "${enabled}" == 1 ]]; then
+        [[ "${matches}" == 1 ]] || die "retention cron postcondition failed"
+    else
+        [[ "${matches}" == 0 ]] || die "disabled retention cron postcondition failed"
+    fi
+}
+
+op_bootstrap() {
+    local repo='' enabled='' schedule='' timezone='' keep_daily='' keep_weekly='' keep_monthly=''
+    local password_stdin=0
+    while (($#)); do
+        case "$1" in
+            --repo) need_arg "$@"; repo=$2; shift 2 ;;
+            --password-stdin) password_stdin=1; shift ;;
+            --enabled) need_arg "$@"; enabled=$2; shift 2 ;;
+            --schedule) need_arg "$@"; schedule=$2; shift 2 ;;
+            --timezone) need_arg "$@"; timezone=$2; shift 2 ;;
+            --keep-daily) need_arg "$@"; keep_daily=$2; shift 2 ;;
+            --keep-weekly) need_arg "$@"; keep_weekly=$2; shift 2 ;;
+            --keep-monthly) need_arg "$@"; keep_monthly=$2; shift 2 ;;
+            *) die "unknown argument: $1" ;;
+        esac
+    done
+    [[ "${password_stdin}" == 1 && -n "${repo}" ]] || die "bootstrap requires repo and password stdin"
+    validate_retention_values "${enabled}" "${schedule}" "${timezone}" \
+        "${keep_daily}" "${keep_weekly}" "${keep_monthly}"
+    read_password_stdin
+    acquire_repo_lock "${repo}"
+    printf '%s\n' "${PASSWORD}" | op_init --repo "${repo}" --password-stdin
+    configure_retention "${repo}" "${enabled}" "${schedule}" "${timezone}" \
+        "${keep_daily}" "${keep_weekly}" "${keep_monthly}" 1
+}
+
+op_ssh_reconcile() {
+    local authorized_keys=$1 directory
+    ((${#authorized_keys} <= 65536)) || die "authorized_keys is too large"
+    directory=$(dirname "${AUTHORIZED_KEYS}")
+    mkdir -p "${directory}"
+    printf '%s\n' "${authorized_keys}" | atomic_write "${AUTHORIZED_KEYS}" 0600
+    if [[ "${RESTIC_ALLOW_NON_ROOT_TESTS:-0}" != 1 ]]; then
+        chown restic:restic "${AUTHORIZED_KEYS}"
+    fi
+}
+
+op_typed_json() {
+    local payload operation repo password enabled schedule timezone keep_daily keep_weekly keep_monthly authorized_keys
+    payload=$(cat)
+    jq -e '
+        type == "object" and .version == 1 and
+        (.definition | type == "object") and
+        (.definition.manager_operation | type == "string") and
+        (.input | type == "object") and
+        (.input | has("operation") | not)
+    ' >/dev/null <<<"${payload}" || die "invalid typed operation payload"
+
+    operation=$(jq -r '.definition.manager_operation' <<<"${payload}")
+    repo=$(jq -r '.input.name // .input.repo_slug // empty' <<<"${payload}")
+    case "${operation}" in
+        repository.bootstrap)
+            password=$(jq -r '.input.password // empty' <<<"${payload}")
+            [[ -n "${password}" ]] || die "repository password is required"
+            enabled=$(jq -r '.input.enabled' <<<"${payload}")
+            schedule=$(jq -r '.input.schedule' <<<"${payload}")
+            timezone=$(jq -r '.input.timezone' <<<"${payload}")
+            keep_daily=$(jq -r '.input.keep_daily' <<<"${payload}")
+            keep_weekly=$(jq -r '.input.keep_weekly' <<<"${payload}")
+            keep_monthly=$(jq -r '.input.keep_monthly' <<<"${payload}")
+            printf '%s\n' "${password}" | op_bootstrap \
+                --repo "${repo}" --password-stdin --enabled "${enabled}" \
+                --schedule "${schedule}" --timezone "${timezone}" \
+                --keep-daily "${keep_daily}" --keep-weekly "${keep_weekly}" \
+                --keep-monthly "${keep_monthly}"
+            ;;
+        repository.reconcile)
+            enabled=$(jq -r '.input.enabled // 1' <<<"${payload}")
+            schedule=$(jq -r '.input.schedule // "03:00"' <<<"${payload}")
+            timezone=$(jq -r '.input.timezone // "UTC"' <<<"${payload}")
+            keep_daily=$(jq -r '.input.keep_daily // 7' <<<"${payload}")
+            keep_weekly=$(jq -r '.input.keep_weekly // 4' <<<"${payload}")
+            keep_monthly=$(jq -r '.input.keep_monthly // 12' <<<"${payload}")
+            op_configure --repo "${repo}" --enabled "${enabled}" --schedule "${schedule}" \
+                --timezone "${timezone}" --keep-daily "${keep_daily}" \
+                --keep-weekly "${keep_weekly}" --keep-monthly "${keep_monthly}"
+            ;;
+        repository.retention.run)
+            op_retention --repo "${repo}"
+            ;;
+        repository.detach)
+            op_detach --repo "${repo}"
+            ;;
+        repository.delete-data)
+            op_delete_data --repo "${repo}"
+            ;;
+        ssh.reconcile)
+            authorized_keys=$(jq -r '.input.authorized_keys // empty' <<<"${payload}")
+            [[ -n "${authorized_keys}" ]] || die "authorized_keys is required"
+            op_ssh_reconcile "${authorized_keys}"
+            ;;
+        *)
+            die "unsupported typed operation"
+            ;;
+    esac
+    password=''
+    payload=''
+}
+
+need_root
+mkdir -p "${REPO_CONFIG}" "${SECRETS}"
+operation=${1:-}
+[[ -n "${operation}" ]] || die "operation required"
+shift
+case "${operation}" in
+    typed-json) op_typed_json ;;
+    bootstrap) op_bootstrap "$@" ;;
+    init) op_init "$@" ;;
+    configure) op_configure "$@" ;;
+    reconcile) op_reconcile "$@" ;;
+    retention) op_retention "$@" ;;
+    detach) op_detach "$@" ;;
+    delete-data) op_delete_data "$@" ;;
+    *) die "unsupported operation: ${operation}" ;;
+esac

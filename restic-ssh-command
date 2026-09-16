@@ -1,0 +1,44 @@
+#!/bin/ash
+# shellcheck shell=dash
+set -eu
+
+command=${SSH_ORIGINAL_COMMAND:-}
+case "${command}" in
+    internal-sftp|sftp)
+        exec /usr/lib/ssh/sftp-server -d /data
+        ;;
+    help)
+        printf '%s\n' \
+            'Allowed commands:' \
+            '  SFTP (used automatically by restic sftp: repositories)' \
+            '  help' \
+            '  list-repositories'
+        ;;
+    list-repositories)
+        # Output names only; never expose manager state or secret files.
+        IFS= read -r username </etc/rest-username
+        case "${username}" in
+            [A-Za-z0-9][A-Za-z0-9_-][A-Za-z0-9_-]*) ;;
+            *) exit 1 ;;
+        esac
+        [ -n "${username}" ] || exit 1
+        for path in "/data/${username}"/*; do
+            if ! {
+                [ -d "${path}" ] && [ ! -L "${path}" ] &&
+                    [ -f "${path}/config" ] && [ ! -L "${path}/config" ]
+            }; then
+                continue
+            fi
+            name=$(basename "${path}")
+            case "${name}" in
+                [a-z0-9]|[a-z0-9][a-z0-9-]*)
+                    printf '%s\n' "${name}"
+                    ;;
+            esac
+        done
+        ;;
+    *)
+        echo "Command is not permitted." >&2
+        exit 126
+        ;;
+esac

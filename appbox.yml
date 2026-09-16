@@ -1,0 +1,677 @@
+app:
+  display_name: "Restic REST Server"
+  publisher: "restic"
+  description: |
+    Restic REST Server provides a high-performance HTTP backend for the restic backup program. It turns your Appbox server into a remote backup destination that any machine running the restic client can back up to — securely and efficiently over HTTPS.
+
+    ## Features
+
+    - High-performance HTTP REST backend for restic backup repositories
+    - Authentication via username and password (htpasswd)
+    - Private repositories — each user can only access their own backup data
+    - Encrypted at rest — restic encrypts all data client-side before upload
+    - Append-only mode available for ransomware protection
+    - Optional restricted SFTP backend over SSH
+    - Scheduled retention with per-repository locking and `forget --prune`
+    - Lightweight Go services supervised by s6-overlay
+    - Compatible with all restic clients on Linux, macOS, Windows, and BSD
+
+    ## Ideal For
+
+    - Self-hosters who want a private backup server instead of relying on cloud storage
+    - Backing up multiple machines (desktops, laptops, other servers) to one central location
+    - Users who want an alternative to S3, Backblaze B2, or other commercial backup targets
+
+    ## Security
+
+    Restic encrypts backup data **client-side** before upload. For repositories created or managed through Appbox, Appbox stores the repository encryption password, and the container keeps a root-only copy for repository initialization and retention. Disabling scheduled retention does not remove that password. Managed repositories therefore require trust in Appbox and privileged server administrators; the client is not the only holder of the decryption credential. The REST login password is a separate credential used to authenticate connections.
+
+    ## Good to Know
+
+    - This is a backup **server** (storage backend). You need the [restic client](https://restic.net) installed on each machine you want to back up.
+    - To connect from a restic client, use: `restic -r rest:https://USERNAME:PASSWORD@YOUR-DOMAIN/USERNAME/ init`
+    - The REST login password and repository encryption password are different credentials.
+    - Retention and backups are serialized per repository. A prune can take substantial time and I/O.
+    - SSH is disabled by default. Enabling it exposes a restricted `restic` account, not a general shell.
+
+  short_description: "A fast, secure HTTP backend for restic backups"
+  icon: icon.png
+  categories:
+    - "Backup"
+    - "Sync"
+  devsite: "https://github.com/restic/rest-server"
+  source_repo: "https://github.com/appbox-co/restic"
+  documentation_url: null
+
+
+# Local-build example, not a deployable catalog release. Before importing,
+# set your registry, version, tag and the digest of your own published build.
+image:
+  name: "restic-appbox"
+  version: "development"
+  tag: "development"
+
+
+container:
+  cmd: null
+  user: null
+  group_add: null
+  memory: 1
+  memory_swap: 0
+  memory_reservation: 0
+  cpus: 0
+  init: false
+  cap_add: null
+  cap_drop: null
+  shm_size: null
+  pids_limit: null
+
+
+networking:
+  subdomain: "restic"
+  is_web_app: true
+  requires_domain: true
+  ssl: true
+  multiple_domains: false
+  tcp_passthrough: false
+
+
+behavior:
+  app_slots: 1
+  expect_callback: true
+  callback_requires_auth: true
+  restart_text: "Active backups and retention jobs will be interrupted. Repository data remains on the persistent volume."
+  can_update: true
+  update_text: "The persistent data volume is reused, but make an independent backup before updating. Do not downgrade after writing data with a newer restic version."
+  allow_downgrade: false
+  ssl_restart: false
+
+
+install:
+  pre_description: "Choose REST credentials and an initial repository slug. Providing its encryption password initializes it automatically. SSH/SFTP is optional and disabled by default; key authentication is recommended. Warning: writable SFTP accesses the repository files directly and bypasses REST append-only protection."
+  post_description: "Your Restic backend is ready. Copy **Restic REST repository** into `RESTIC_REPOSITORY`, provide **REST login password** as `RESTIC_REST_PASSWORD`, and use **Repository encryption password** as `RESTIC_PASSWORD`. The repository URL contains the REST username, hostname, private namespace, and initial repository name without exposing a credential in the configuration list. When SSH/SFTP is enabled, copy **SSH connection** to connect with your selected password or private key. For SFTP, use the same username, hostname, and port in `sftp -P PORT USERNAME@HOST`. SSH is restricted to SFTP plus `help` and `list-repositories`: interactive shells, forwarding, and arbitrary commands are disabled. SFTP paths start at `/data`; writable SFTP bypasses REST append-only protection."
+  custom_description: null
+
+
+ports:
+  tcp:
+    range: "2222"
+    dynamic: 0
+  udp:
+    range: null
+    dynamic: 0
+  combined:
+    range: null
+    dynamic: 0
+
+
+volumes:
+  - source: "data"
+    destination: "/srv/restic-sftp/data"
+    permissions: "rw"
+    uid: 1000
+
+
+env:
+  - key: VIRTUAL_PORT
+    value: "8000"
+    template_type: none
+
+
+custom_fields:
+
+  USERNAME:
+    label: "Username"
+    type: dynamicText
+    width: 6
+    default_value: "admin"
+    template_type: none
+    validate:
+      - required
+      - alphanumeric
+      - { minLength: 3 }
+    params:
+      showOnInstalled: false
+
+  PASSWORD:
+    label: "REST login password"
+    type: generatedPassword
+    width: 6
+    default_value: "%RAND.32%"
+    template_type: password
+    sensitive: true
+    revealable: true
+    validate: []
+    params: {}
+
+  APPEND_ONLY:
+    label: "Append-only mode"
+    type: switch
+    width: 6
+    default_value: "0"
+    template_type: none
+    validate: []
+    params:
+      menuItems:
+        "1": "Enabled"
+        "0": "Disabled"
+
+  INITIAL_REPOSITORY:
+    label: "Initial repository"
+    type: dynamicText
+    width: 6
+    default_value: "default"
+    template_type: none
+    validate:
+      - required
+      - { regex: "^[a-z0-9][a-z0-9-]{0,62}$", errorText: "Use lowercase letters, numbers, and hyphens." }
+    params:
+      showOnInstalled: false
+
+  RESTIC_PASSWORD:
+    label: "Repository encryption password"
+    type: generatedPassword
+    width: 6
+    default_value: "%RAND.32%"
+    template_type: password
+    required: true
+    sensitive: true
+    revealable: true
+    validate:
+      - required
+    params:
+      generatedPasswordLength: 32
+
+  SSH_ENABLED:
+    label: "Enable SSH/SFTP"
+    type: switch
+    width: 4
+    default_value: "0"
+    template_type: none
+    validate: []
+    params:
+      showOnInstalled: false
+      menuItems:
+        "1": "Enabled"
+        "0": "Disabled"
+
+  SSH_AUTH_MODE:
+    label: "SSH authentication"
+    type: selector
+    # Conditional UI/runtime validation; not globally required by the installer.
+    required: false
+    width: 4
+    default_value: ""
+    template_type: none
+    validate:
+      - required
+    params:
+      menuItems:
+        key: "Public key"
+        password: "Password"
+    condition:
+      field: SSH_ENABLED
+      operator: equals
+      value: "1"
+      clear_when_hidden: true
+
+  SSH_PASSWORD:
+    label: "SSH password"
+    type: password
+    required: false
+    width: 4
+    default_value: ""
+    template_type: password
+    sensitive: true
+    revealable: true
+    validate:
+      - required
+    params:
+      generatePassword: true
+      generatedPasswordLength: 32
+    condition:
+      field: SSH_AUTH_MODE
+      operator: equals
+      value: password
+      clear_when_hidden: true
+
+  SSH_PUBLIC_KEY:
+    label: "SSH public key"
+    type: dynamicText
+    required: false
+    width: 12
+    default_value: ""
+    template_type: none
+    validate:
+      - required
+    params:
+      showOnInstalled: false
+    condition:
+      field: SSH_AUTH_MODE
+      operator: equals
+      value: key
+      clear_when_hidden: true
+
+  SSH_USERNAME:
+    label: "SSH username"
+    type: staticText
+    width: 4
+    default_value: "restic"
+    template_type: none
+    validate: []
+    params:
+      showOnInstalled: false
+    condition:
+      field: SSH_ENABLED
+      operator: equals
+      value: "1"
+
+  SSH_HOST:
+    label: "SSH host"
+    type: staticText
+    width: 4
+    default_value: "%DOMAIN.DOMAIN%"
+    template_type: instance
+    validate: []
+    params:
+      showOnInstalled: false
+    condition:
+      field: SSH_ENABLED
+      operator: equals
+      value: "1"
+
+  SSH_PORT:
+    label: "SSH port"
+    type: staticText
+    width: 4
+    default_value: "%PORTS|0.EXTERNAL%"
+    template_type: instance
+    validate: []
+    params:
+      showOnInstalled: false
+    condition:
+      field: SSH_ENABLED
+      operator: equals
+      value: "1"
+
+  CONNECT_URL:
+    label: "Restic REST repository"
+    type: staticText
+    width: 12
+    default_value: "rest:https://%USERNAME%@%DOMAIN.DOMAIN%/%USERNAME%/%INITIAL_REPOSITORY%"
+    template_type: instance
+    validate:
+      - { maxLength: 4096 }
+    params: {}
+
+  SSH_CONNECTION:
+    label: "SSH connection"
+    type: staticText
+    width: 12
+    default_value: "ssh %SSH_USERNAME%@%DOMAIN.DOMAIN% -p%PORTS|0.EXTERNAL%"
+    template_type: instance
+    validate: []
+    params: {}
+    condition:
+      field: SSH_ENABLED
+      operator: equals
+      value: "1"
+
+typed_operations:
+  repository-init-manager:
+    manager_operation: repository.bootstrap
+    executor: container_exec
+    executable: /usr/local/bin/cylo-restic-manager
+    arguments: [typed-json]
+    stdin_mode: json
+    timeout_seconds: 1800
+    redact_output: true
+    max_stdin_bytes: 65536
+    max_output_bytes: 65536
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [name, password, enabled, schedule, timezone, keep_daily, keep_weekly, keep_monthly]
+      properties:
+        name:
+          type: string
+          pattern: "/^[a-z0-9][a-z0-9-]{0,62}$/D"
+          maxLength: 63
+        password:
+          type: string
+          minLength: 1
+          maxLength: 8192
+        enabled:
+          type: string
+          pattern: "/^[01]$/D"
+        schedule:
+          type: string
+          pattern: "/^([01][0-9]|2[0-3]):[0-5][0-9]$/D"
+        timezone:
+          type: string
+          minLength: 1
+          maxLength: 255
+        keep_daily:
+          type: integer
+          minimum: 0
+          maximum: 100000
+        keep_weekly:
+          type: integer
+          minimum: 0
+          maximum: 100000
+        keep_monthly:
+          type: integer
+          minimum: 0
+          maximum: 100000
+    sensitive_input_paths: [password]
+    lock_policy:
+      scope: instance_resource
+      input_paths: [name]
+    target_policy:
+      type: instance_container
+    image_policy:
+      mode: installed_app_version
+      require_digest: true
+
+  repository-reconcile-manager:
+    manager_operation: repository.reconcile
+    executor: container_exec
+    executable: /usr/local/bin/cylo-restic-manager
+    arguments: [typed-json]
+    stdin_mode: json
+    timeout_seconds: 1800
+    redact_output: true
+    max_stdin_bytes: 65536
+    max_output_bytes: 65536
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [name, enabled, schedule, timezone, keep_daily, keep_weekly, keep_monthly]
+      properties:
+        name:
+          type: string
+          pattern: "/^[a-z0-9][a-z0-9-]{0,62}$/D"
+          maxLength: 63
+        enabled:
+          type: string
+        schedule:
+          type: string
+          pattern: "/^([01][0-9]|2[0-3]):[0-5][0-9]$/D"
+        timezone:
+          type: string
+          minLength: 1
+          maxLength: 255
+        keep_daily:
+          type: integer
+          minimum: 0
+          maximum: 100000
+        keep_weekly:
+          type: integer
+          minimum: 0
+          maximum: 100000
+        keep_monthly:
+          type: integer
+          minimum: 0
+          maximum: 100000
+    lock_policy:
+      scope: instance_resource
+      input_paths: [name]
+    target_policy:
+      type: instance_container
+    image_policy:
+      mode: installed_app_version
+      require_digest: true
+
+  repository-retention-manager:
+    manager_operation: repository.retention.run
+    executor: container_exec
+    executable: /usr/local/bin/cylo-restic-manager
+    arguments: [typed-json]
+    stdin_mode: json
+    timeout_seconds: 1800
+    redact_output: true
+    max_stdin_bytes: 65536
+    max_output_bytes: 65536
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          pattern: "/^[a-z0-9][a-z0-9-]{0,62}$/D"
+          maxLength: 63
+    lock_policy:
+      scope: instance_resource
+      input_paths: [name]
+    target_policy:
+      type: instance_container
+    image_policy:
+      mode: installed_app_version
+      require_digest: true
+
+  repository-detach-manager:
+    manager_operation: repository.detach
+    executor: container_exec
+    executable: /usr/local/bin/cylo-restic-manager
+    arguments: [typed-json]
+    stdin_mode: json
+    timeout_seconds: 1800
+    redact_output: true
+    max_stdin_bytes: 65536
+    max_output_bytes: 65536
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          pattern: "/^[a-z0-9][a-z0-9-]{0,62}$/D"
+          maxLength: 63
+    lock_policy:
+      scope: instance_resource
+      input_paths: [name]
+    target_policy:
+      type: instance_container
+    image_policy:
+      mode: installed_app_version
+      require_digest: true
+
+  repository-delete-data-manager:
+    manager_operation: repository.delete-data
+    executor: container_exec
+    executable: /usr/local/bin/cylo-restic-manager
+    arguments: [typed-json]
+    stdin_mode: json
+    timeout_seconds: 1800
+    redact_output: true
+    max_stdin_bytes: 65536
+    max_output_bytes: 65536
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          pattern: "/^[a-z0-9][a-z0-9-]{0,62}$/D"
+          maxLength: 63
+    lock_policy:
+      scope: instance_resource
+      input_paths: [name]
+    target_policy:
+      type: instance_container
+    image_policy:
+      mode: installed_app_version
+      require_digest: true
+
+  ssh-reconcile-manager:
+    manager_operation: ssh.reconcile
+    executor: container_exec
+    executable: /usr/local/bin/cylo-restic-manager
+    arguments: [typed-json]
+    stdin_mode: json
+    timeout_seconds: 60
+    redact_output: true
+    max_stdin_bytes: 65536
+    max_output_bytes: 65536
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [authorized_keys]
+      properties:
+        authorized_keys:
+          type: string
+          maxLength: 65536
+    sensitive_input_paths: [authorized_keys]
+    lock_policy:
+      scope: instance_operation
+    target_policy:
+      type: instance_container
+    image_policy:
+      mode: installed_app_version
+      require_digest: true
+
+custom_tables:
+  - id: repositories
+    label: "Repositories"
+    description: "Create repositories, edit scheduled retention, and run maintenance actions."
+    type_of: restic_repository
+    max_rows: 100
+    # App/version catalog gates control release; tables use instance permissions.
+    admin_only: false
+    enable_adding: true
+    enable_editing: true
+    enable_deleting: false
+    enable_filters: true
+    fields:
+      name:
+        label: "Name"
+        type: dynamicText
+        required: true
+        editable: false
+        unique: true
+        validate:
+          - required
+          - { regex: "^[a-z0-9][a-z0-9-]{0,62}$", errorText: "Use lowercase letters, numbers, and hyphens." }
+      password:
+        label: "Encryption password"
+        type: password
+        required: true
+        editable: false
+        sensitive: true
+      enabled:
+        label: "Scheduled retention"
+        type: switch
+        default_value: "1"
+      schedule:
+        label: "Retention time"
+        type: dynamicText
+        default_value: "03:00"
+        validate:
+          - required
+          - { regex: "^([01][0-9]|2[0-3]):[0-5][0-9]$", errorText: "Use 24-hour HH:MM format." }
+      timezone:
+        label: "Timezone"
+        type: dynamicText
+        default_value: "UTC"
+      keep_daily:
+        label: "Daily snapshots"
+        type: number
+        default_value: 7
+      keep_weekly:
+        label: "Weekly snapshots"
+        type: number
+        default_value: 4
+      keep_monthly:
+        label: "Monthly snapshots"
+        type: number
+        default_value: 12
+    initial_rows:
+      - name: install.INITIAL_REPOSITORY
+        password: install.RESTIC_PASSWORD
+        enabled: "1"
+        schedule: "03:00"
+        timezone: "UTC"
+        keep_daily: 7
+        keep_weekly: 4
+        keep_monthly: 12
+    initial_rows_operation:
+      operation: repository-init-manager
+      input:
+        name: row.name
+        password: row.password
+        enabled: row.enabled
+        schedule: row.schedule
+        timezone: row.timezone
+        keep_daily: row.keep_daily
+        keep_weekly: row.keep_weekly
+        keep_monthly: row.keep_monthly
+    create_operation:
+      operation: repository-init-manager
+      input:
+        name: row.name
+        password: row.password
+        enabled: row.enabled
+        schedule: row.schedule
+        timezone: row.timezone
+        keep_daily: row.keep_daily
+        keep_weekly: row.keep_weekly
+        keep_monthly: row.keep_monthly
+    update_operation:
+      operation: repository-reconcile-manager
+      input:
+        name: row.name
+        enabled: row.enabled
+        schedule: row.schedule
+        timezone: row.timezone
+        keep_daily: row.keep_daily
+        keep_weekly: row.keep_weekly
+        keep_monthly: row.keep_monthly
+    row_actions:
+      - id: run-retention
+        label: "Run retention now"
+        operation: repository-retention-manager
+        input:
+          name: row.name
+      - id: delete-data
+        label: "Permanently delete data"
+        operation: repository-delete-data-manager
+        input:
+          name: row.name
+        strong_confirmation:
+          phrase: "DELETE DATA"
+          field: confirmation
+
+custom_buttons:
+  - id: reconcile-ssh
+    label: "Apply SSH public key"
+    icon: terminal
+    icon_color: primary
+    dialog_text: "Apply a new authorized key to the running SSH/SFTP service."
+    admin_only: true
+    visibility_conditions:
+      - field: SSH_ENABLED
+        operator: equals
+        value: "1"
+      - field: SSH_AUTH_MODE
+        operator: equals
+        value: key
+    operation: ssh-reconcile-manager
+    input_form:
+      authorized_keys:
+        label: "SSH public key"
+        type: dynamicText
+        width: 12
+        sensitive: true
+        validate:
+          - required
+    input:
+      authorized_keys: payload.authorized_keys
+
+advanced:
+  devices: []
+  ulimits: []
+  sysctls: []
+  chains: []

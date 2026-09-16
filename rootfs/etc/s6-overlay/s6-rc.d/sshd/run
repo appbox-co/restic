@@ -1,0 +1,23 @@
+#!/bin/ash
+set -eu
+[ "${SSH_ENABLED:-0}" = 1 ] || exec s6-sleep 2147483647
+
+case "${SSH_AUTH_MODE:-key}" in
+    key) password_auth=no ;;
+    password) password_auth=yes ;;
+    *) echo "Invalid SSH_AUTH_MODE" >&2; exit 64 ;;
+esac
+
+exec /usr/sbin/sshd -D -e \
+    -o Port=2222 \
+    -o PermitRootLogin=no \
+    -o AllowUsers=restic \
+    -o PasswordAuthentication="${password_auth}" \
+    -o PubkeyAuthentication=yes \
+    -o PermitTTY=no \
+    -o AllowTcpForwarding=no \
+    -o X11Forwarding=no \
+    -o PermitTunnel=no \
+    -o GatewayPorts=no \
+    -o ForceCommand=/bin/restic-ssh-command \
+    -o ChrootDirectory=/srv/restic-sftp

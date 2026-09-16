@@ -1,0 +1,4 @@
+#!/bin/ash
+# Alpine dcron calls setpgid(), which Docker's default seccomp profile blocks.
+# BusyBox crond provides the required foreground scheduler without that syscall.
+exec /bin/busybox crond -f -l 6

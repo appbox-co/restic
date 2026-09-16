@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly CONFIG_FLAG="${CONFIG_FLAG:-/srv/restic-sftp/data/.restic-manager/app_configured}"
+
+[[ "${SKIP_APPBOX_CALLBACK:-0}" == 1 ]] && exit 0
+[[ -n "${INSTANCE_ID:-}" ]] || {
+    echo "restic callback: INSTANCE_ID is required" >&2
+    exit 64
+}
+[[ -n "${CALLBACK_TOKEN:-}" ]] || {
+    echo "restic callback: CALLBACK_TOKEN is required" >&2
+    exit 64
+}
+[[ -f "${CONFIG_FLAG}" ]] && exit 0
+
+[[ -n "${APPBOX_API_URL:-}" ]] || {
+    echo "restic callback: APPBOX_API_URL is required" >&2
+    exit 64
+}
+url="${APPBOX_API_URL%/}/apps/installed/${INSTANCE_ID}"
+accepted_request=0
+for _ in $(seq 1 12); do
+    status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        -H "X-Cylo-Callback-Token: ${CALLBACK_TOKEN}" "${url}" || true)
+    case "${status}" in
+        2??)
+            touch "${CONFIG_FLAG}"
+            exit 0
+            ;;
+        5??)
+            # Authentication is checked before callback processing. A later
+            # 401 means an asynchronous bootstrap completed and consumed the
+            # one-time callback token while this request was unwinding.
+            accepted_request=1
+            ;;
+        401)
+            if [[ "${accepted_request}" == 1 ]]; then
+                touch "${CONFIG_FLAG}"
+                exit 0
+            fi
+            ;;
+    esac
+    sleep 5
+done
+
+echo "restic callback: Appbox callback failed after 12 attempts" >&2
+exit 1
