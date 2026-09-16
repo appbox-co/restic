@@ -14,11 +14,7 @@ readonly CONFIG_FLAG="${CONFIG_FLAG:-/srv/restic-sftp/data/.restic-manager/app_c
 }
 [[ -f "${CONFIG_FLAG}" ]] && exit 0
 
-[[ -n "${APPBOX_API_URL:-}" ]] || {
-    echo "restic callback: APPBOX_API_URL is required" >&2
-    exit 64
-}
-url="${APPBOX_API_URL%/}/apps/installed/${INSTANCE_ID}"
+url="${APPBOX_API_URL:-https://api.cylo.net/v1}/apps/installed/${INSTANCE_ID}"
 accepted_request=0
 for _ in $(seq 1 12); do
     status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \

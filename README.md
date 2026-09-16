@@ -14,18 +14,20 @@ and [rest-server](https://github.com/restic/rest-server).
 docker build -t restic-appbox:development .
 ```
 
-The checked-in `appbox.yml` uses a local development image name. It is an
-integration template, not a published catalog release. To deploy your own
-build, supply your registry, version, tag, and immutable image digest. The
-manifest requires compatible Appbox Custom Table and typed-operation support.
-Publishing this source does not publish a container image or change catalog
-availability.
+The checked-in `appbox.yml` retains the Appbox image reference for version
+`0.14.0-12`, including its immutable digest. Pulling that image requires access
+to the Appbox registry. For your own build, use a separate image reference and
+update its version, tag, and digest after publication; do not reuse the existing
+digest for a rebuilt image. The manifest requires compatible Appbox Custom Table
+and typed-operation support. Publishing this source does not publish a container
+image or change catalog availability.
 
 For a standalone container, set `USERNAME`, `PASSWORD`, and
 `SKIP_APPBOX_CALLBACK=1`, mount your persistent data at `/srv/restic-sftp/data`,
 and explicitly initialize repositories using the manager below. SSH is
-optional. Appbox-managed callbacks require `APPBOX_API_URL` (the API base URL),
-`INSTANCE_ID`, and `CALLBACK_TOKEN`. No deployment URL or token is included.
+optional. Appbox-managed callbacks require `INSTANCE_ID` and `CALLBACK_TOKEN`.
+The API base URL defaults to `https://api.cylo.net/v1`; `APPBOX_API_URL` is an
+optional override for another environment. No credentials or tokens are included.
 The callback authentication header and compatibility executable name are kept
 for protocol compatibility.
 

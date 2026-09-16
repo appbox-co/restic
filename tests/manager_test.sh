@@ -55,9 +55,13 @@ assert manifest["volumes"] == [{
     "uid": 1000,
 }]
 assert manifest["image"] == {
-    "name": "restic-appbox",
-    "version": "development",
-    "tag": "development",
+    "name": "repo.cylo.net/restic",
+    "version": "0.14.0-12",
+    "tag": "0.14.0-12",
+    "digest": (
+        "repo.cylo.net/restic@sha256:"
+        "9df1fbec98449e52dce0be787b8c0391a83e05c8b652b6dfae38232e154ab3e0"
+    ),
 }
 assert manifest["custom_fields"]["RESTIC_PASSWORD"]["sensitive"] is True
 assert manifest["custom_fields"]["RESTIC_PASSWORD"]["revealable"] is True

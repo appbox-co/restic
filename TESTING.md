@@ -10,9 +10,10 @@ Requirements: Bash, Python 3 with PyYAML, and jq.
 ```sh
 bash -n entrypoint.sh moduser.sh restic-manager restic-callback \
   tests/manager_test.sh tests/release_gate.sh tests/container_release_test.sh \
-  tests/container_ssh_listing_test.sh
+  tests/container_ssh_listing_test.sh tests/callback_test.sh
 sh -n restic-ssh-command
 bash tests/manager_test.sh
+bash tests/callback_test.sh
 ```
 
 The manager suite covers repository creation, typed operation input,
@@ -20,6 +21,10 @@ idempotent retries, credential preservation, verified legacy-layout migration,
 retention configuration, schedule rollback, and deletion boundaries. It uses
 mock `restic` and `flock` commands and allows non-root execution. A pass does
 not verify real encryption, Linux permissions, container startup, or locking.
+
+The callback suite uses a mock HTTP client without network access. It verifies
+the Appbox default URL, an empty override falling back to that default, a custom
+URL, local callback bypass, and rejection of a missing callback token.
 
 ## Container build and runtime checks
 
@@ -88,5 +93,6 @@ transports separately. Writable SFTP bypasses REST append-only protection.
 
 When validating the Appbox integration, check repository creation, retention
 editing, operation completion feedback, and hidden/revealed credential fields.
-Appbox integration requires a compatible control plane; this repository does
-not contain its deployment configuration or credentials.
+Appbox integration requires a compatible control plane. This repository retains
+the non-secret callback default and image metadata, but does not contain control
+plane deployment configuration or credentials.
